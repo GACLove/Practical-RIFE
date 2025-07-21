@@ -6,81 +6,8 @@ import numpy as np
 from tqdm import tqdm
 from torch.nn import functional as F
 import warnings
-import imageio_ffmpeg as ffmpeg
-from model.pytorch_msssim import ssim_matlab
 
 warnings.filterwarnings("ignore")
-
-
-def transferAudio(sourceVideo, targetVideo):
-    import shutil
-
-    tempAudioFileName = "./temp/audio.mkv"
-
-    # split audio from original video file and store in "temp" directory
-    if True:
-        # clear old "temp" directory if it exits
-        if os.path.isdir("temp"):
-            # remove temp directory
-            shutil.rmtree("temp")
-        # create new "temp" directory
-        os.makedirs("temp")
-        # extract audio from video
-        os.system(
-            '{} -y -i "{}" -c:a copy -vn {}'.format(
-                ffmpeg.get_ffmpeg_exe(), sourceVideo, tempAudioFileName
-            )
-        )
-
-    targetNoAudio = (
-        os.path.splitext(targetVideo)[0] + "_noaudio" + os.path.splitext(targetVideo)[1]
-    )
-    os.rename(targetVideo, targetNoAudio)
-    # combine audio file and new video file
-    os.system(
-        '{} -y -i "{}" -i {} -c copy "{}"'.format(
-            ffmpeg.get_ffmpeg_exe(), targetNoAudio, tempAudioFileName, targetVideo
-        )
-    )
-
-    if (
-        os.path.getsize(targetVideo) == 0
-    ):  # if ffmpeg failed to merge the video and audio together try converting the audio to aac
-        tempAudioFileName = "./temp/audio.m4a"
-        os.system(
-            '{} -y -i "{}" -c:a aac -b:a 160k -vn {}'.format(
-                ffmpeg.get_ffmpeg_exe(), sourceVideo, tempAudioFileName
-            )
-        )
-        os.system(
-            '{} -y -i "{}" -i {} -c copy "{}"'.format(
-                ffmpeg.get_ffmpeg_exe(), targetNoAudio, tempAudioFileName, targetVideo
-            )
-        )
-        if (
-            os.path.getsize(targetVideo) == 0
-        ):  # if aac is not supported by selected format
-            os.rename(targetNoAudio, targetVideo)
-            print("Audio transfer failed. Interpolated video will have no audio")
-        else:
-            print(
-                "Lossless audio transfer failed. Audio was transcoded to AAC (M4A) instead."
-            )
-
-            # remove audio-less video
-            os.remove(targetNoAudio)
-    else:
-        os.remove(targetNoAudio)
-
-    # remove temp directory
-    shutil.rmtree("temp")
-
-
-def pad_image(img, padding, fp16):
-    if fp16:
-        return F.pad(img, padding).half()
-    else:
-        return F.pad(img, padding)
 
 
 def calculate_target_frame_positions(source_fps, target_fps, total_source_frames):
@@ -114,7 +41,7 @@ def calculate_target_frame_positions(source_fps, target_fps, total_source_frames
             interpolation_factor = source_position - source_idx1
 
         frame_positions.append((source_idx1, source_idx2, interpolation_factor))
-    print(frame_positions)
+
     return frame_positions
 
 
@@ -136,33 +63,14 @@ def main():
         help="directory with trained model files",
     )
     parser.add_argument(
-        "--fp16",
-        dest="fp16",
-        action="store_true",
-        help="fp16 mode for faster and more lightweight inference on cards with Tensor Cores",
-    )
-    parser.add_argument(
-        "--UHD", dest="UHD", action="store_true", help="support 4k video"
-    )
-    parser.add_argument(
         "--scale",
         dest="scale",
         type=float,
         default=1.0,
-        help="Try scale=0.5 for 4k video",
-    )
-    parser.add_argument(
-        "--skip_static",
-        action="store_true",
-        help="Skip interpolation for static frames (frames with high similarity)",
+        help="Scale factor for processing",
     )
 
     args = parser.parse_args()
-
-    # Adjust scale for UHD
-    if args.UHD and args.scale == 1.0:
-        args.scale = 0.5
-    assert args.scale in [0.25, 0.5, 1.0, 2.0, 4.0]
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -170,17 +78,13 @@ def main():
     if torch.cuda.is_available():
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = True
-        if args.fp16:
-            torch.set_default_tensor_type(torch.cuda.HalfTensor)
 
     # Load model
     from train_log.RIFE_HDv3 import Model
 
     model = Model()
-    if not hasattr(model, "version"):
-        model.version = 0
     model.load_model(args.modelDir, -1)
-    print("Loaded 3.x/4.x HD model.")
+    print("Loaded RIFE HD model.")
     model.eval()
     model.device()
 
@@ -209,7 +113,7 @@ def main():
     print(f"Total target frames: {len(frame_positions)}")
 
     # Setup output video writer
-    fourcc = cv2.VideoWriter_fourcc("m", "p", "4", "v")
+    fourcc = cv2.VideoWriter.fourcc("m", "p", "4", "v")
     if args.output:
         output_path = args.output
     else:
@@ -218,7 +122,7 @@ def main():
 
     out = cv2.VideoWriter(output_path, fourcc, args.target_fps, (width, height))
 
-    # Load all frames into memory (for easier random access)
+    # Load all frames into memory
     print("Loading source frames...")
     frames = []
     while True:
@@ -241,7 +145,7 @@ def main():
             frame1 = frames[source_idx1]
             frame2 = frames[source_idx2]
 
-            # Convert to tensors (make copy to avoid negative stride issue)
+            # Convert to tensors (BGR to RGB and normalize)
             I0 = (
                 torch.from_numpy(np.transpose(frame1[:, :, ::-1].copy(), (2, 0, 1)))
                 .to(device)
@@ -258,26 +162,8 @@ def main():
             )
 
             # Pad images
-            I0 = pad_image(I0, padding, args.fp16)
-            I1 = pad_image(I1, padding, args.fp16)
-
-            # Skip interpolation for static frames if requested
-            if args.skip_static:
-                I0_small = F.interpolate(
-                    I0, (32, 32), mode="bilinear", align_corners=False
-                )
-                I1_small = F.interpolate(
-                    I1, (32, 32), mode="bilinear", align_corners=False
-                )
-                ssim_val = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
-
-                if ssim_val > 0.996:  # Very similar frames
-                    # Use simple blending instead of neural interpolation
-                    alpha = interp_factor
-                    blended = cv2.addWeighted(frame1, 1 - alpha, frame2, alpha, 0)
-                    out.write(blended)
-                    pbar.update(1)
-                    continue
+            I0 = F.pad(I0, padding)
+            I1 = F.pad(I1, padding)
 
             # Perform interpolation
             with torch.no_grad():
@@ -300,14 +186,7 @@ def main():
     pbar.close()
     out.release()
 
-    # Transfer audio
-    print("Transferring audio...")
-    try:
-        transferAudio(args.input, output_path)
-        print(f"Output saved to: {output_path}")
-    except Exception as e:
-        print(f"Audio transfer failed: {e}")
-        print(f"Output saved to: {output_path} (without audio)")
+    print(f"Output saved to: {output_path}")
 
 
 if __name__ == "__main__":
